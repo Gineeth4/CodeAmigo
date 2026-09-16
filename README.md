@@ -105,9 +105,9 @@ pip install fastapi uvicorn sse-starlette
 
 # Run the local server (Ensure this matches your IP)
 uvicorn main:app --host 0.0.0.0 --port 8000
-
-2. The React Native Frontend
-
+```
+### 2. The React Native Frontend
+```bash
 # Clone this repository
 git clone [https://github.com/Gineeth4/CodeAmigo.git](https://github.com/Gineeth4/CodeAmigo.git)
 cd CodeAmigo
