@@ -124,7 +124,7 @@ export default function LoginScreen() {
           promptMessage: 'Login to CodeAmigo' 
         });
         if (result.success) {
-          router.replace('/scanner');
+          router.replace({ pathname: '/scanner', params: { source: 'login' } });
         }
       }
     } catch (e) {
@@ -165,7 +165,7 @@ export default function LoginScreen() {
       const data = await response.json();
       if (response.ok) {
         await SecureStore.setItemAsync('saved_name', name);
-        router.replace('/scanner');
+        router.replace({ pathname: '/scanner', params: { source: 'login' } });
       } else {
         const errorDetail = typeof data.detail === 'string' ? data.detail : (data.message || "Invalid PIN.");
         setErrorMsg(errorDetail);

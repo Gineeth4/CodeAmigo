@@ -2,7 +2,7 @@ import React, { useState, useCallback, useEffect } from 'react';
 import { View, Text, StyleSheet, TouchableOpacity, Alert, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { useRouter, useFocusEffect } from 'expo-router';
+import { useRouter, useFocusEffect, useLocalSearchParams } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
 import { Gesture, GestureDetector } from 'react-native-gesture-handler';
 import Animated, { 
@@ -52,6 +52,7 @@ export default function ScannerScreen() {
   const [permission, requestPermission] = useCameraPermissions();
   const [scanned, setScanned] = useState(false);
   const router = useRouter();
+  const { source } = useLocalSearchParams();
 
   const [showFeatures, setShowFeatures] = useState(false);
   const [userRole, setUserRole] = useState("Student");
@@ -151,9 +152,14 @@ export default function ScannerScreen() {
       }
   
       // 4. Fetch the role and show the UI
-      const role = await SecureStore.getItemAsync('user_role');
-      if (role && ROLE_FEATURES[role]) setUserRole(role);
-      setShowFeatures(true);
+      if (source === 'signup') {
+        const role = await SecureStore.getItemAsync('user_role');
+        if (role && ROLE_FEATURES[role]) setUserRole(role);
+        setShowFeatures(true);
+      } else {
+        // If they logged in, skip the overlay and go straight to chat.
+        router.replace('/chat');
+      }
       
     } catch (error) {
       Alert.alert("Invalid QR", "Please scan a valid CodeAmigo backend QR code.");

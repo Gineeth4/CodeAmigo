@@ -131,7 +131,7 @@ export default function SignupScreen() {
         await SecureStore.setItemAsync('is_device_registered', 'true');
         await SecureStore.setItemAsync('saved_name', name);
         await SecureStore.setItemAsync('user_role', role);
-        router.replace('/scanner');
+        router.replace({ pathname: '/scanner', params: { source: 'signup' } });
       } else {
         Alert.alert('Error', data.message || data.detail || "Sign up failed.");
       }

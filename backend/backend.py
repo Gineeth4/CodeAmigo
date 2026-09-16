@@ -83,6 +83,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+async def health_check():
+    """
+    Lightweight endpoint for the React Native frontend to ping 
+    and verify the local bridge is active.
+    """
+    return {"status": "CodeAmigo Backend Active"}
+
 # Global state to track paired device IP for 1:1 hardware lockdown
 paired_client_ip = None
 
