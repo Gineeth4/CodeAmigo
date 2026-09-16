@@ -117,7 +117,7 @@ npm install
 
 # Start the Expo server
 npx expo start
-'''bash
+```
 
 Note: Ensure your mobile device and your laptop/server are connected to the exact same local Wi-Fi network for the QR scanner to successfully handshake.
 
