@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+qrcode[pil]
+pydantic
+httpx
+pyperclip
+psutil
+PyGetWindow
+Pillow
+pytesseract
+bcrypt
+pyautogui
