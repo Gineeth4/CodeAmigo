@@ -7,10 +7,12 @@ import {
   TouchableOpacity, 
   Platform, 
   ScrollView,
-  Alert
+  Alert,
+  Modal
 } from 'react-native';
 import { useRouter } from 'expo-router';
 import * as SecureStore from 'expo-secure-store';
+import * as LocalAuthentication from 'expo-local-authentication';
 import { useSafeAreaInsets, SafeAreaView } from 'react-native-safe-area-context';
 import { StatusBar } from 'expo-status-bar';
 import Constants from 'expo-constants';
@@ -95,6 +97,7 @@ export default function SignupScreen() {
   const [focusedInput, setFocusedInput] = useState<string | null>(null);
   
   const [errorMsg, setErrorMsg] = useState('');
+  const [showNoAccountsModal, setShowNoAccountsModal] = useState(false);
 
   useEffect(() => {
     SecureStore.deleteItemAsync('backend_url').catch(console.error);
@@ -115,28 +118,98 @@ export default function SignupScreen() {
       return;
     }
 
-    try {
-      const response = await fetch(`${getBackendURL()}/auth/signup`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: name,
-          role: role,
-          pin: signupPin
-        })
-      });
+    const payload = {
+      name: name,
+      role: role,
+      pin: signupPin
+    };
 
+    await handleAuthorizedSignup(payload);
+  };
+
+  const handleAuthorizedSignup = async (signupPayload: any) => {
+    try {
+      // 1. Check if accounts already exist on this device
+      const response = await fetch(`${getBackendURL()}/auth/users`);
       const data = await response.json();
-      if (response.ok) {
-        await SecureStore.setItemAsync('is_device_registered', 'true');
-        await SecureStore.setItemAsync('saved_name', name);
-        await SecureStore.setItemAsync('user_role', role);
-        router.replace({ pathname: '/scanner', params: { source: 'signup' } });
-      } else {
-        Alert.alert('Error', data.message || data.detail || "Sign up failed.");
+      const isFirstAccount = data.status === 'success' && data.users.length === 0;
+
+      if (!isFirstAccount) {
+        // 2. If accounts already exist, require authorization before adding a new account
+        const hasHardware = await LocalAuthentication.hasHardwareAsync();
+        const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+
+        let authorized = false;
+
+        if (hasHardware && isEnrolled) {
+          const result = await LocalAuthentication.authenticateAsync({
+            promptMessage: 'Authorize New Account Creation',
+            fallbackLabel: 'Use Admin PIN'
+          });
+          if (result.success) {
+            authorized = true;
+          }
+        } else {
+          // Fallback or explicit secondary password prompt check can be added here
+          authorized = true; // Fallback if no biometrics
+        }
+
+        if (!authorized) {
+          Alert.alert("Access Denied", "Biometric authorization failed. Cannot create a new account.");
+          return;
+        }
       }
+
+      // 3. Proceed to execute signup
+      await executeSignupRequest(signupPayload, isFirstAccount);
     } catch (e) {
       Alert.alert('Network Error', `Cannot reach backend at ${getBackendURL()}. Check laptop Wi-Fi and firewall.`);
+    }
+  };
+
+  const executeSignupRequest = async (payload: any, isFirstAccount: boolean) => {
+    try {
+      const res = await fetch(`${getBackendURL()}/auth/signup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const result = await res.json();
+
+      if (res.ok && result.status === 'success') {
+        await SecureStore.setItemAsync('is_device_registered', 'true');
+        await SecureStore.setItemAsync('saved_name', payload.name);
+        await SecureStore.setItemAsync('user_role', payload.role);
+        await SecureStore.setItemAsync('session_token', result.session_token);
+        
+        if (isFirstAccount) {
+          // Show QR Code Pairing Screen ONLY for the very first account on a fresh device
+          router.replace({ pathname: '/scanner', params: { source: 'signup' } });
+        } else {
+          // Skip QR pairing for subsequent accounts and go straight to chat
+          router.replace('/chat');
+        }
+      } else {
+        Alert.alert("Signup Failed", result.detail || result.message || "Could not create account.");
+      }
+    } catch (e) {
+      Alert.alert("Error", "Network connection failed.");
+    }
+  };
+
+  const handleLoginNavigation = async () => {
+    try {
+      const response = await fetch(`${getBackendURL()}/auth/users`);
+      const data = await response.json();
+      
+      if (data.status === 'success' && data.users.length > 0) {
+        router.replace('/login'); 
+      } else {
+        // Block navigation and show custom modal
+        setShowNoAccountsModal(true);
+      }
+    } catch (error) {
+      Alert.alert("Network Error", "Could not verify accounts with the backend.");
     }
   };
 
@@ -215,7 +288,7 @@ export default function SignupScreen() {
               <Text style={styles.submitBtnText}>Complete Sign Up</Text>
             </TouchableOpacity>
 
-            <TouchableOpacity onPress={() => router.push('/login')} style={{ marginTop: 20, alignItems: 'center' }}>
+            <TouchableOpacity onPress={handleLoginNavigation} style={{ marginTop: 20, alignItems: 'center' }}>
               <Text style={{ color: '#0A84FF', fontSize: 16 }}>Already have an account? Log In</Text>
             </TouchableOpacity>
           </View>
@@ -226,6 +299,25 @@ export default function SignupScreen() {
         </View>
       </ScrollView>
       </Animated.View>
+      {/* Custom No Accounts Modal */}
+      <Modal visible={showNoAccountsModal} transparent animationType="fade">
+        <View style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center' }}>
+          <View style={{ backgroundColor: '#1E1E20', padding: 24, borderRadius: 16, width: '80%', alignItems: 'center', borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)' }}>
+            <Text style={{ color: '#EF4444', fontSize: 20, fontWeight: 'bold', marginBottom: 12 }}>
+              No Accounts Found
+            </Text>
+            <Text style={{ color: '#A1A1AA', textAlign: 'center', marginBottom: 24, fontSize: 16, lineHeight: 24 }}>
+              There are no registered accounts on this device. Please complete the sign up process first.
+            </Text>
+            <TouchableOpacity 
+              onPress={() => setShowNoAccountsModal(false)} 
+              style={{ backgroundColor: '#0A84FF', paddingHorizontal: 32, paddingVertical: 12, borderRadius: 12, width: '100%', alignItems: 'center' }}
+            >
+              <Text style={{ color: '#000', fontWeight: 'bold', fontSize: 16 }}>OK</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }

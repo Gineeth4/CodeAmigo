@@ -52,13 +52,38 @@ export default function WelcomeScreen() {
 
   const { width } = Dimensions.get('window');
 
-  const handleUnlock = async () => {
+  const verifyDatabaseState = async () => {
+    try {
+      const { getBackendURL } = require('./login');
+      const backendURL = getBackendURL();
+      const response = await fetch(`${backendURL}/auth/users`);
+      const data = await response.json();
+      
+      if (data.status === 'success' && data.users.length === 0) {
+        console.log("Backend database is empty. Wiping local ghost data...");
+        // Wipe all local session data to prevent ghost logins
+        await SecureStore.deleteItemAsync('session_token');
+        await SecureStore.deleteItemAsync('saved_name');
+        await SecureStore.deleteItemAsync('is_device_registered');
+        
+        router.replace('/signup');
+        return; 
+      }
+    } catch (error) {
+      console.error("Failed to connect to backend on boot.", error);
+    }
+
+    // Accounts exist or offline fallback: Proceed to normal routing
     const isRegistered = await SecureStore.getItemAsync('is_device_registered');
     if (isRegistered === 'true') {
       router.replace('/login');
     } else {
       router.replace('/signup');
     }
+  };
+
+  const handleUnlock = async () => {
+    await verifyDatabaseState();
   };
 
   const panGesture = Gesture.Pan()

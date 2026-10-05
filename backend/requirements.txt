@@ -10,3 +10,5 @@ Pillow
 pytesseract
 bcrypt
 pyautogui
+bs4
+googlesearch-python

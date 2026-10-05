@@ -24,7 +24,8 @@ import {
 import * as SecureStore from 'expo-secure-store';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Markdown from 'react-native-markdown-display';
-import { Clipboard as ClipboardIcon, Settings, Copy, Bot, Monitor, Menu, Trash2, ArrowDownCircle } from 'lucide-react-native';
+import { Clipboard as ClipboardIcon, Settings, Copy, Bot, Monitor, Menu, Trash2, ArrowDownCircle, User, Fingerprint, CheckCircle } from 'lucide-react-native';
+import * as LocalAuthentication from 'expo-local-authentication';
 import EventSource from 'react-native-sse';
 import * as ExpoClipboard from 'expo-clipboard';
 import * as Haptics from 'expo-haptics';
@@ -93,12 +94,23 @@ const ROLE_FEATURES: Record<string, { title: string; desc: string }[]> = {
   ]
 };
 
-const formatMathForMarkdown = (text: string) => {
+const formatMessageText = (text: string) => {
   if (!text) return text;
-  // Convert block math \[ \] to standard markdown code blocks
+  
+  // 1. Convert block math \[ \] to standard markdown code blocks
   let formatted = text.replace(/\\\[(.*?)\\\]/gs, '```math\n$1\n```');
-  // Convert inline math \( \) to inline code backticks
+  
+  // 2. Convert inline math \( \) to inline code backticks
   formatted = formatted.replace(/\\\((.*?)\\\)/gs, '`$1`');
+  
+  // 3. Fix completely missing spaces (e.g., "to0" -> "to 0", "summing10" -> "summing 10")
+  // We require at least 2 letters ([a-zA-Z]{2,}) to avoid breaking single-letter variables like "x1" or "v2".
+  formatted = formatted.replace(/([a-zA-Z]{2,})(\d+)/g, '$1 $2');
+  
+  // 4. Fix React Native font space collapse
+  // Forces a non-breaking space (\u00A0) anywhere a word is followed by a space and a number
+  formatted = formatted.replace(/([a-zA-Z]+)\s+(\d+)/g, '$1\u00A0$2');
+  
   return formatted;
 };
 
@@ -108,7 +120,8 @@ interface Message {
   id: string;
   role: 'user' | 'ai';
   content: string;
-  type?: 'text' | 'terminal';
+  type?: 'text' | 'terminal' | 'agent_intercept' | 'agent_proceed' | 'agent_done';
+  originalPrompt?: string; // NEW FIELD
 }
 
 interface ChatSession {
@@ -188,7 +201,7 @@ const CustomCodeBlock = React.memo(({ children, language, themeColors, backendUR
   );
 });
 
-const MessageBubble = React.memo(({ item, themeColors, styles, backendURL }: { item: Message, themeColors: any, styles: any, backendURL: string }) => {
+const MessageBubble = React.memo(({ item, themeColors, styles, backendURL, onLongPressBubble, handleAgentAction }: { item: Message, themeColors: any, styles: any, backendURL: string, onLongPressBubble?: (content: string) => void, handleAgentAction?: (messageId: string, action: 'skip' | 'proceed_prompt' | 'execute') => void }) => {
   const isUser = item.role === 'user';
   const isError = item.content.startsWith("[ERROR]");
   
@@ -209,36 +222,23 @@ const MessageBubble = React.memo(({ item, themeColors, styles, backendURL }: { i
 
   const handleLongPress = () => {
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-    if (Platform.OS === 'ios') {
-      ActionSheetIOS.showActionSheetWithOptions(
-        {
-          options: ['Cancel', 'Copy Text', 'Regenerate', 'Fork Session'],
-          cancelButtonIndex: 0,
-        },
-        (buttonIndex) => {
-          if (buttonIndex === 1) {
-            ExpoClipboard.setStringAsync(item.content);
-            Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-          } else if (buttonIndex === 2) {
-            Alert.alert("Regenerate", "Regeneration triggered.");
-          } else if (buttonIndex === 3) {
-            Alert.alert("Fork Session", "Fork triggered.");
-          }
-        }
-      );
-    } else {
-      Alert.alert(
-        "Message Actions",
-        "Select an action:",
-        [
-          { text: "Copy Text", onPress: () => { ExpoClipboard.setStringAsync(item.content); Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success); } },
-          { text: "Regenerate", onPress: () => Alert.alert("Regenerate", "Regeneration triggered.") },
-          { text: "Fork Session", onPress: () => Alert.alert("Fork Session", "Fork triggered.") },
-          { text: "Cancel", style: "cancel" }
-        ]
-      );
+    if (onLongPressBubble) {
+      onLongPressBubble(item.content);
     }
   };
+
+
+  if (item.type === 'agent_proceed') {
+    return (
+      <View style={[styles.messageBubble, { alignSelf: 'flex-start', backgroundColor: 'rgba(234, 179, 8, 0.2)', borderColor: '#EAB308', borderWidth: 1, borderBottomLeftRadius: 2, padding: 16 }]}>
+        <Text style={{ color: '#FDE047', fontSize: 16, fontWeight: 'bold', marginBottom: 8 }}>⚠️ Action Required</Text>
+        <Text style={{ color: '#FFF', fontSize: 14, marginBottom: 16 }}>Make sure your cursor is actively placed in your laptop's codespace before proceeding.</Text>
+        <TouchableOpacity style={{ backgroundColor: '#EAB308', padding: 12, borderRadius: 8, alignItems: 'center' }} onPress={() => handleAgentAction && handleAgentAction(item.id, 'execute')}>
+          <Text style={{ color: '#000', fontWeight: 'bold' }}>🚀 Proceed</Text>
+        </TouchableOpacity>
+      </View>
+    );
+  }
 
   if (item.type === 'terminal') {
     return (
@@ -263,7 +263,9 @@ const MessageBubble = React.memo(({ item, themeColors, styles, backendURL }: { i
       ) : isError ? (
         <Text style={{ color: '#ff453a', fontSize: 16 }}>{item.content}</Text>
       ) : (
-        <Markdown rules={markdownRules} style={markdownStyles}>{formatMathForMarkdown(item.content)}</Markdown>
+        <Markdown rules={markdownRules} style={markdownStyles}>
+          {formatMessageText(item.content)}
+        </Markdown>
       )}
     </Pressable>
   );
@@ -328,6 +330,41 @@ const ChatScreen = () => {
   const [isBackendConnected, setIsBackendConnected] = useState(false);
   const [isLoadingPairing, setIsLoadingPairing] = useState(true);
 
+  const [coreMemories, setCoreMemories] = useState<string[]>([]);
+  const [actionMenuVisible, setActionMenuVisible] = useState(false);
+  const [selectedMessageText, setSelectedMessageText] = useState("");
+  const [calmAlertVisible, setCalmAlertVisible] = useState(false);
+  const [isStudyMode, setIsStudyMode] = useState(false);
+
+  interface AccountItem { name: string; role: string; }
+  const [availableAccounts, setAvailableAccounts] = useState<AccountItem[]>([]);
+  const [authAction, setAuthAction] = useState<'login' | 'delete'>('login'); // NEW: Tracks what the PIN is being used for
+  const [isSwitchAuthVisible, setIsSwitchAuthVisible] = useState(false);
+  const [selectedAccountName, setSelectedAccountName] = useState('');
+  const [switchPin, setSwitchPin] = useState('');
+  const [authError, setAuthError] = useState('');
+
+  useEffect(() => {
+    if (!backendURL) return;
+    const fetchMemories = async () => {
+      try {
+        const response = await fetch(`${backendURL}/memory`);
+        if (response.ok) {
+          const data = await response.json();
+          const fetchedMemories = data.memories || data.memory_list || [];
+          
+          // Only update if the backend actually sent data, preventing the overwrite bug
+          if (fetchedMemories.length > 0) {
+            setCoreMemories(fetchedMemories);
+          }
+        }
+      } catch (error) {}
+    };
+    fetchMemories();
+    const intervalId = setInterval(fetchMemories, 5000);
+    return () => clearInterval(intervalId);
+  }, [backendURL]);
+
   useEffect(() => {
     if (!backendURL) return;
 
@@ -364,7 +401,11 @@ const ChatScreen = () => {
   const [currentPersona, setCurrentPersona] = useState<Persona>('Standard');
   const [isSettingsModalVisible, setIsSettingsModalVisible] = useState(false);
   const [coreMemory, setCoreMemory] = useState<string[]>([]);
+  const [userMemory, setUserMemory] = useState<string[]>([]);
+  const [userName, setUserName] = useState('');
   const [userRole, setUserRole] = useState('Student');
+  const [isAgenticMode, setIsAgenticMode] = useState(false);
+  const [authSuccessMessage, setAuthSuccessMessage] = useState('');
 
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string>('');
@@ -408,20 +449,41 @@ const ChatScreen = () => {
   };
 
   useEffect(() => {
-    async function loadConnection() {
-      const savedUrl = await SecureStore.getItemAsync('backend_url');
-      if (savedUrl) {
-        setBackendURL(savedUrl);
+    const enforceSecurityBarrier = async () => {
+      try {
+        const token = await SecureStore.getItemAsync('session_token');
+        
+        if (!token) {
+          console.warn("[SECURITY EJECTION]: Unauthorized access attempt detected. No session token found.");
+          router.replace('/signup');
+          return;
+        }
+
+        const savedUrl = await SecureStore.getItemAsync('backend_url');
+        if (savedUrl) {
+          setBackendURL(savedUrl);
+        }
+        setIsLoadingPairing(false);
+        
+        const restoredUserName = await SecureStore.getItemAsync('saved_name');
+        if (restoredUserName) {
+          setUserName(restoredUserName);
+          await loadUserSessions(restoredUserName);
+          await fetchUserMemory(restoredUserName);
+        } else {
+          await loadUserSessions();
+        }
+      } catch (error) {
+        console.error("Security check failed", error);
+        router.replace('/signup');
       }
-      setIsLoadingPairing(false);
-    }
-    loadConnection();
-    loadSessions();
+    };
+    enforceSecurityBarrier();
   }, []);
 
   useEffect(() => {
-    if (isSettingsModalVisible) {
-      fetchCoreMemory();
+    if (isSettingsModalVisible && userName) {
+      fetchUserMemory(userName);
     }
   }, [isSettingsModalVisible]);
   
@@ -435,15 +497,19 @@ const ChatScreen = () => {
     fetchRole();
   }, []);
   
+  // AUTO-SAVE HOOK: Fires every single time the 'messages' array changes
   useEffect(() => {
-    if (currentSessionId && messages.length > 0) {
-      saveCurrentSession(currentSessionId, messages);
+    // Only save if there are actual messages to save, preventing empty overwrites
+    if (messages.length > 0 && currentSessionId && userName) {
+      saveActiveSession(messages);
     }
-  }, [messages, currentSessionId]);
+  }, [messages, currentSessionId, userName]);
 
-  const loadSessions = async () => {
+  const loadUserSessions = async (targetUserName?: string) => {
     try {
-      const stored = await AsyncStorage.getItem('@chat_sessions');
+      const nameToLoad = targetUserName || userName || await SecureStore.getItemAsync('saved_name');
+      if (!nameToLoad) return;
+      const stored = await AsyncStorage.getItem(`@sessions_${nameToLoad}`);
       if (stored) {
         const parsed: ChatSession[] = JSON.parse(stored);
         setSessions(parsed);
@@ -454,30 +520,44 @@ const ChatScreen = () => {
           createNewSession();
         }
       } else {
+        setSessions([]);
         createNewSession();
       }
     } catch (e) {
+      setSessions([]);
       createNewSession();
     }
   };
 
-  const saveCurrentSession = async (id: string, msgs: Message[]) => {
-    try {
-      setSessions(prev => {
-        const existing = prev.find(s => s.id === id);
-        const title = existing?.title || (msgs[0]?.content.substring(0, 30) || 'New Chat');
-        const updatedSession = { id, title, messages: msgs };
-        
-        let newSessions;
-        if (existing) {
-          newSessions = prev.map(s => s.id === id ? updatedSession : s);
-        } else {
-          newSessions = [updatedSession, ...prev];
-        }
-        AsyncStorage.setItem('@chat_sessions', JSON.stringify(newSessions));
-        return newSessions;
-      });
-    } catch (e) {}
+  // Safely updates the active session and writes directly to the user's isolated storage
+  const saveActiveSession = async (updatedMessages: Message[]) => {
+    if (!userName || !currentSessionId || updatedMessages.length === 0) return;
+
+    setSessions(prevSessions => {
+      const existingIndex = prevSessions.findIndex(s => s.id === currentSessionId);
+      let newSessions = [...prevSessions];
+
+      if (existingIndex >= 0) {
+        // Update the existing chat session with the new messages
+        newSessions[existingIndex] = {
+          ...newSessions[existingIndex],
+          messages: updatedMessages,
+        };
+      } else {
+        // If this is a brand new chat, create the session object
+        newSessions = [{
+          id: currentSessionId,
+          title: updatedMessages[0]?.content?.substring(0, 30) + '...' || 'New Chat',
+          messages: updatedMessages
+        }, ...prevSessions];
+      }
+
+      // IMMEDIATELY persist to the hardware using the active user's exact key
+      AsyncStorage.setItem(`@sessions_${userName}`, JSON.stringify(newSessions))
+        .catch(err => console.error("Failed to save session to disk:", err));
+
+      return newSessions;
+    });
   };
 
   const createNewSession = () => {
@@ -500,7 +580,7 @@ const ChatScreen = () => {
   const deleteSession = async (id: string) => {
     const newSessions = sessions.filter(s => s.id !== id);
     setSessions(newSessions);
-    await AsyncStorage.setItem('@chat_sessions', JSON.stringify(newSessions));
+    if (userName) await AsyncStorage.setItem(`@sessions_${userName}`, JSON.stringify(newSessions));
     if (currentSessionId === id) {
       if (newSessions.length > 0) {
         switchSession(newSessions[0].id);
@@ -520,26 +600,32 @@ const ChatScreen = () => {
     setIsSidebarOpen(!(isSidebarOpen || forceClose));
   };
 
-  const fetchCoreMemory = async () => {
+  const fetchUserMemory = async (currentUserName: string) => {
+    // 1. Abort gracefully if no user is selected or backendURL is undefined
+    if (!currentUserName || !backendURL) {
+      console.log("[Memory] Skipping fetch: User or Backend URL not ready.");
+      return;
+    }
+    
     try {
-      const session_token = await SecureStore.getItemAsync('session_token');
-      if (session_token) {
-        const response = await fetch(`${backendURL}/memory`, {
-          headers: { 'session-token': session_token }
-        });
-        if (response.ok) {
-          const data = await response.json();
-          setCoreMemory(data.memory_list || (data.memory_text ? data.memory_text.split('\n') : []));
-        }
+      const response = await fetch(`${backendURL}/auth/user/memory?name=${currentUserName}`);
+      const data = await response.json();
+      
+      if (data.status === 'success') {
+        if (typeof setCoreMemory === 'function') setCoreMemory(data.core_memory);
+        if (typeof setUserMemory === 'function') setUserMemory(data.user_memory);
       }
-    } catch (e) {}
+    } catch (error) {
+      // 2. Silently catch network errors so the app DOES NOT crash
+      console.log("[Memory] Network unreachable, but app will continue safely.", error);
+    }
   };
 
 
 
 
-  const sendMessage = async () => {
-    const text = inputText.trim();
+  const sendMessage = async (overrideText?: string | any, overrideHistory?: Message[], skipAgent: boolean = false) => {
+    const text = overrideText || inputText.trim();
     if (!text || isLoading) return;
 
     Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
@@ -556,14 +642,50 @@ const ChatScreen = () => {
       finalMessage = finalMessage.replace('/complexity ', '');
     }
 
-    const userMessage: Message = { id: Date.now().toString() + '-user', role: 'user', content: finalMessage };
+    // AGENTIC OVERRIDE FLOW (SMART ROUTING)
+    if (isAgenticMode && !isCommand) {
+      // Expanded intercept: Catches "code", "script", languages, and structural terms
+      const isLaptopTypingRequest = /\b(code|script|program|java|python|javascript|cpp|c\+\+|html|css|function|class|loop)\b/i.test(finalMessage);
+      
+      // Ignore special agent commands so they pass through to the chat stream
+      const isSpecialCommand = finalMessage.startsWith('/');
+
+      // Only hijack for laptop typing if it's a code request AND not a slash command
+      if (isLaptopTypingRequest && !isSpecialCommand) {
+        const userMessage: Message = { id: Date.now().toString() + '-user', role: 'user', content: finalMessage };
+        const proceedMessage: Message = { 
+          id: Date.now().toString() + '-agent', 
+          role: 'ai', 
+          content: '', 
+          type: 'agent_proceed', 
+          originalPrompt: finalMessage 
+        };
+        
+        setMessages(overrideHistory ? [...overrideHistory, proceedMessage] : [...messages, userMessage, proceedMessage]);
+        if (!overrideHistory) setInputText('');
+        setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+        return; // Stop here! Wait for the user to click "Proceed".
+      }
+    }
+
     const aiMessageId = (Date.now() + 1).toString() + '-ai';
     const initialAiMessage: Message = { id: aiMessageId, role: 'ai', content: '', type: isCommand ? 'terminal' : 'text' };
     
-    const newMessagesForState = [...messages, userMessage, initialAiMessage];
+    let newMessagesForState;
+    let baseHistoryForApi;
+
+    if (overrideHistory) {
+      newMessagesForState = [...overrideHistory, initialAiMessage];
+      baseHistoryForApi = overrideHistory;
+    } else {
+      const userMessage: Message = { id: Date.now().toString() + '-user', role: 'user', content: finalMessage };
+      newMessagesForState = [...messages, userMessage, initialAiMessage];
+      baseHistoryForApi = [...messages, userMessage];
+    }
+    
     setMessages(newMessagesForState);
     setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
-    setInputText('');
+    if (!overrideText) setInputText('');
     setIsLoading(true);
     setHasReceivedFirstChunk(false);
 
@@ -576,30 +698,31 @@ const ChatScreen = () => {
       }
 
       abortControllerRef.current = new AbortController();
-      const finalApiMessage = finalMessage;
 
       // Convert messages to Ollama format
-      const apiMessages = messages.map(m => {
+      const apiMessages = baseHistoryForApi.map(m => {
         return {
           role: m.role === 'ai' ? 'assistant' : m.role,
           content: m.content
         };
       });
       
-      apiMessages.push({ role: 'user', content: finalApiMessage });
+      apiMessages.push({ role: 'user', content: finalMessage });
 
-      const es = new EventSource(`${backendURL}/chat`, {
+      const es = new EventSource<"memory">(`${backendURL}/chat`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          // session-token removed since hardware lockdown is bypassed for chat
         },
         ...(abortControllerRef.current ? { signal: abortControllerRef.current.signal } : {}),
         body: JSON.stringify({
           messages: apiMessages,
           persona: finalPersona,
           is_command: isCommand,
-          role: userRole
+          role: userRole,
+          is_study_mode: isStudyMode,
+          is_agentic_mode: isAgenticMode,
+          name: userName // NEW: Crucial for the backend to fetch this user's memory
         })
       });
       eventSourceRef.current = es;
@@ -632,6 +755,17 @@ const ChatScreen = () => {
         if (event.data) {
           try {
             const data = JSON.parse(event.data);
+            if (data.type === 'agent_intercept') {
+              setMessages(prev => {
+                const newMsgs = [...prev];
+                newMsgs[newMsgs.length - 1] = { ...newMsgs[newMsgs.length - 1], type: 'agent_intercept', originalPrompt: data.prompt };
+                return newMsgs;
+              });
+              es.close();
+              setIsLoading(false);
+              setHasReceivedFirstChunk(true);
+              return;
+            }
             if (data.error) {
               setMessages(prev => 
                 prev.map(m => m.id === aiMessageId ? { ...m, content: m.content + `\n\nError: ${data.error}` } : m)
@@ -643,12 +777,33 @@ const ChatScreen = () => {
             }
             if (data.chunk) {
               setHasReceivedFirstChunk(true);
+
+              let chunkText = data.chunk;
+
+              // Intercept Core Memory tags
+              const memoryMatch = chunkText.match(/\[CORE_MEMORY:\s*(.+?)\]/);
+              if (memoryMatch) {
+                const extractedFact = memoryMatch[1];
+                setCoreMemories((prev) => !prev.includes(extractedFact) ? [...prev, extractedFact] : prev);
+                chunkText = chunkText.replace(/\[CORE_MEMORY:\s*(.+?)\]/, '');
+              }
+
+              // Intercept CALM Mode tags
+              if (chunkText.includes('[CALM_MODE_ACTIVE]')) {
+                setCalmAlertVisible(true);
+                setTimeout(() => setCalmAlertVisible(false), 5000);
+                chunkText = chunkText.replace('[CALM_MODE_ACTIVE]', '');
+              }
+
+              // Prevent empty chunk rendering
+              if (chunkText.trim() === '' && !data.chunk.includes('\n')) return;
+
               setMessages(prevMessages => {
                 const newMessages = [...prevMessages];
                 const lastIndex = newMessages.length - 1;
                 newMessages[lastIndex] = {
                   ...newMessages[lastIndex],
-                  content: newMessages[lastIndex].content + data.chunk
+                  content: newMessages[lastIndex].content + chunkText
                 };
                 return newMessages;
               });
@@ -710,9 +865,51 @@ const ChatScreen = () => {
 
 
 
+  const handleAgentAction = async (messageId: string, action: 'skip' | 'proceed_prompt' | 'execute') => {
+    const msgIndex = messages.findIndex(m => m.id === messageId);
+    const msg = messages[msgIndex];
+    if (!msg || !msg.originalPrompt) return;
+
+    if (action === 'skip') {
+      // Re-run normally, skipping the interceptor
+      const history = messages.slice(0, msgIndex - 1);
+      sendMessage(msg.originalPrompt, history, true);
+    } else if (action === 'proceed_prompt') {
+      // Advance UI to the warning state
+      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, type: 'agent_proceed' } : m));
+    } else if (action === 'execute') {
+      // Fire execution endpoint
+      setMessages(prev => prev.map(m => m.id === messageId ? { ...m, type: 'agent_done', content: 'Typing code into your laptop in real-time...' } : m));
+      try {
+        const token = await SecureStore.getItemAsync('session_token');
+        await fetch(`${backendURL}/agent/type`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'session-token': token || '' },
+          body: JSON.stringify({ 
+            prompt: msg.originalPrompt,
+            name: userName // NEW: Sends the active profile name to fetch memory
+          })
+        });
+        setMessages(prev => prev.map(m => m.id === messageId ? { ...m, content: 'Code successfully typed into laptop.' } : m));
+      } catch (e) {}
+    }
+  };
+
   const renderItem = useCallback(({ item }: { item: Message }) => {
-    return <MessageBubble item={item} themeColors={themeColors} styles={styles} backendURL={backendURL!} />;
-  }, [themeColors, backendURL]);
+    return (
+      <MessageBubble 
+        item={item} 
+        themeColors={themeColors} 
+        styles={styles} 
+        backendURL={backendURL!} 
+        onLongPressBubble={(content) => {
+          setSelectedMessageText(content);
+          setActionMenuVisible(true);
+        }}
+        handleAgentAction={handleAgentAction}
+      />
+    );
+  }, [themeColors, backendURL, messages]);
 
   if (isLoadingPairing) {
     return (
@@ -748,6 +945,123 @@ const ChatScreen = () => {
       <Trash2 color="#FFF" size={20} />
     </TouchableOpacity>
   );
+
+  const openSwitchAccount = async () => {
+    try {
+      const response = await fetch(`${backendURL}/auth/users`);
+      const data = await response.json();
+      if (data.status === 'success') {
+        setAvailableAccounts(data.users);
+        setIsSwitchAuthVisible(true);
+        setSwitchPin('');
+        setAuthError('');
+        setAuthAction('login'); // Default to login
+      }
+    } catch (error) {
+      console.error("Failed to fetch users", error);
+    }
+  };
+
+  const executeSecureAuthAction = async (isBiometric: boolean = false) => {
+    if (!selectedAccountName) {
+      setAuthError('Please select an account.');
+      return;
+    }
+    if (!isBiometric && switchPin.length !== 6) {
+      setAuthError('Please enter the 6-digit PIN.');
+      return;
+    }
+
+    try {
+      const endpoint = authAction === 'delete' ? '/auth/user' : '/auth/login';
+      const method = authAction === 'delete' ? 'DELETE' : 'POST';
+      
+      const response = await fetch(`${backendURL}${endpoint}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          name: selectedAccountName, 
+          pin: isBiometric ? null : switchPin,
+          biometric_auth: isBiometric 
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.status === 'success') {
+        if (authAction === 'delete') {
+          // --- NEW: PERMANENTLY DESTROY LOCAL DATA ---
+          // Wipe the specific user's chat history from the phone's hard drive so it can never be recovered
+          await AsyncStorage.removeItem(`@sessions_${selectedAccountName}`);
+          // ------------------------------------------
+
+          setAuthSuccessMessage(`Farewell, ${selectedAccountName}. Account deleted.`);
+          setTimeout(async () => {
+            setAuthSuccessMessage('');
+            if (availableAccounts.length <= 1) {
+              // Zero accounts left: Wipe token and redirect to Auth/Signup Screen
+              await SecureStore.deleteItemAsync('session_token');
+              setIsSwitchAuthVisible(false);
+              router.replace('/');
+            } else {
+              openSwitchAccount(); // Refresh list if accounts still remain
+            }
+          }, 2000);
+        } else {
+          // --- NEW LOGIN SUCCESS LOGIC ---
+          
+          // 1. Securely store the new token
+          await SecureStore.setItemAsync('session_token', data.session_token);
+          
+          // 2. Update the active React states to instantly transform the UI!
+          setUserName(data.name);
+          setUserRole(data.role);
+          
+          // 3. WIPE the active chat canvas so they don't see the previous user's active screen
+          setMessages([]);
+          setCurrentSessionId('');
+          setInputText('');
+          
+          // 4. RESTORE the incoming user's specific session history!
+          await loadUserSessions(data.name);
+          await fetchUserMemory(data.name);
+          
+          // 5. Trigger the beautifully styled success view (matching the delete style)
+          setAuthSuccessMessage(`Welcome back, ${data.name}!`);
+          
+          // 6. Wait for the user to see the success message, then close the modal
+          setTimeout(() => {
+            setAuthSuccessMessage('');
+            setIsSwitchAuthVisible(false);
+            setIsSettingsModalVisible(false);
+          }, 1500);
+        }
+      } else {
+        setAuthError(data.detail || 'Authentication failed.');
+      }
+    } catch (error) {
+      setAuthError('Network error connecting to backend.');
+    }
+  };
+
+  const handleBiometricAuth = async () => {
+    const hasHardware = await LocalAuthentication.hasHardwareAsync();
+    const isEnrolled = await LocalAuthentication.isEnrolledAsync();
+    
+    if (!hasHardware || !isEnrolled) {
+      setAuthError('Biometrics not setup on this device.');
+      return;
+    }
+    
+    const result = await LocalAuthentication.authenticateAsync({
+      promptMessage: authAction === 'delete' ? 'Authenticate to Delete Profile' : 'Authenticate to Unlock Profile',
+      fallbackLabel: 'Use PIN'
+    });
+    
+    if (result.success) {
+      executeSecureAuthAction(true);
+    }
+  };
 
   return (
     <View style={{ flex: 1, backgroundColor: '#0D1117' }}>
@@ -791,24 +1105,73 @@ const ChatScreen = () => {
             </Swipeable>
           )}
         />
-        <TouchableOpacity 
-          style={{ flexDirection: 'row', alignItems: 'center', paddingVertical: 20, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)', marginTop: 'auto' }} 
-          onPress={() => { toggleSidebar(true); setIsSettingsModalVisible(true); }}
-        >
-          <Settings color={themeColors.Accent} size={20} />
-          <Text style={{ color: '#FFF', fontSize: 16, marginLeft: 10, fontWeight: '500' }}>Preferences</Text>
-        </TouchableOpacity>
+
+        {/* Sidebar Footer */}
+        <View style={{ padding: 20, borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.1)', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 'auto' }}>
+          <TouchableOpacity 
+            style={{ flexDirection: 'row', alignItems: 'center' }} 
+            onPress={() => setIsSettingsModalVisible(true)}
+          >
+            <Settings color={themeColors.Accent} size={24} />
+            <Text style={{ color: '#FFF', fontSize: 16, marginLeft: 12 }}>Preferences</Text>
+          </TouchableOpacity>
+
+          {/* NEW: The Avatar Switcher */}
+          <TouchableOpacity 
+            style={{ backgroundColor: 'rgba(255,255,255,0.1)', padding: 8, borderRadius: 20 }}
+            onPress={() => {
+              Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+              openSwitchAccount();
+            }}
+          >
+            <User color={themeColors.Accent} size={20} />
+          </TouchableOpacity>
+        </View>
       </Animated.View>
 
       {/* Main Content */}
       <View style={{ paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight : 0 }}>
-        <View style={[styles.topBar, { backgroundColor: themeColors.Surface, justifyContent: 'center' }]}>
+        {/* Header Top Bar */}
+        <View style={[styles.topBar, { backgroundColor: themeColors.Surface, justifyContent: 'center', alignItems: 'center' }]}>
+          
+          {/* Left: Sidebar Toggle */}
           <TouchableOpacity onPress={() => toggleSidebar()} style={{ position: 'absolute', left: 15, zIndex: 1 }}>
             <Menu color={themeColors.Accent} size={24} />
           </TouchableOpacity>
+          
+          {/* Center: Title & Beacon */}
           <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-            <Text style={[styles.headerTitle, { color: accentColor, fontWeight: '600', letterSpacing: 0.5 }]}>CodeAmigo</Text>
+            <Text style={[styles.headerTitle, { color: accentColor, fontWeight: '600', letterSpacing: 0.5 }]}>
+              CodeAmigo
+            </Text>
             <ConnectionBeacon accentColor={accentColor} isBackendConnected={isBackendConnected} />
+          </View>
+
+          {/* Right: Toggles Container */}
+          <View style={{ position: 'absolute', right: 15, zIndex: 1, flexDirection: 'row', alignItems: 'center', gap: 16 }}>
+            
+            {/* Study Toggle (STRICTLY ONLY FOR STUDENT ROLE) */}
+            {userRole === 'Student' && (
+              <Pressable onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); setIsStudyMode(!isStudyMode); }}>
+                <Text style={{
+                  color: isStudyMode ? accentColor : '#666', fontWeight: 'bold', fontSize: 14, textTransform: 'uppercase', letterSpacing: 1,
+                  textShadowColor: isStudyMode ? accentColor : 'transparent', textShadowRadius: isStudyMode ? 10 : 0
+                }}>
+                  Study
+                </Text>
+              </Pressable>
+            )}
+
+            {/* Agentic Toggle (AVAILABLE TO ALL ROLES) */}
+            <Pressable onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light); setIsAgenticMode(!isAgenticMode); }}>
+              <Text style={{
+                color: isAgenticMode ? accentColor : '#666', fontWeight: 'bold', fontSize: 14, textTransform: 'uppercase', letterSpacing: 1,
+                textShadowColor: isAgenticMode ? accentColor : 'transparent', textShadowRadius: isAgenticMode ? 10 : 0
+              }}>
+                Agent
+              </Text>
+            </Pressable>
+
           </View>
         </View>
       </View>
@@ -821,6 +1184,13 @@ const ChatScreen = () => {
           keyExtractor={(item) => item.id}
           renderItem={renderItem}
           contentContainerStyle={{ flexGrow: 1, paddingBottom: 16 }}
+          
+          /* NEW: Performance Optimization Props */
+          initialNumToRender={10}
+          maxToRenderPerBatch={5}
+          windowSize={5}
+          removeClippedSubviews={true}
+
           keyboardShouldPersistTaps="handled"
           onScroll={handleScroll}
           scrollEventThrottle={16}
@@ -863,7 +1233,7 @@ const ChatScreen = () => {
                       <Text style={styles.sendButtonText}>Stop</Text>
                     </TouchableOpacity>
                   ) : (
-                    <TouchableOpacity style={[styles.sendButton, { backgroundColor: themeColors.Accent }]} onPress={sendMessage}>
+                    <TouchableOpacity style={[styles.sendButton, { backgroundColor: themeColors.Accent }]} onPress={() => sendMessage()}>
                       <Text style={styles.sendButtonText}>Send</Text>
                     </TouchableOpacity>
                   )}
@@ -876,36 +1246,30 @@ const ChatScreen = () => {
 
       {/* Settings Modal */}
       <Modal visible={isSettingsModalVisible} transparent animationType="fade">
-        <TouchableWithoutFeedback onPress={() => setIsSettingsModalVisible(false)}>
-          {/* 1. The Overlay: paddingVertical strictly prevents the modal from touching top/bottom */}
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+          
+          {/* 1. SIBLING A: The Background Overlay (Absolute Fill) */}
+          {/* Because this is absolute and a sibling, it catches background taps without wrapping the content */}
+          <Pressable 
+            style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(0,0,0,0.7)' }]} 
+            onPress={() => setIsSettingsModalVisible(false)} 
+          />
+          
+          {/* 2. SIBLING B: The Modal Content Box */}
+          {/* This is just a View. No touch wrappers, no gesture stealers. */}
           <View style={{ 
-            flex: 1, 
-            justifyContent: 'center', 
-            alignItems: 'center', 
-            backgroundColor: 'rgba(0,0,0,0.7)'
+            backgroundColor: '#1E1E20', 
+            borderRadius: 24, 
+            width: '90%', 
+            height: Dimensions.get('window').height * 0.75, 
+            overflow: 'hidden', 
+            paddingTop: 20,
+            zIndex: 1 // Ensures it sits above the absolute background
           }}>
             
-            {/* THE FIX: Use explicit height, NOT maxHeight */}
-            <TouchableWithoutFeedback>
-              <View style={{ 
-                backgroundColor: '#1E1E20', 
-                borderRadius: 24, 
-                width: '90%', 
-                height: height * 0.75, // CRITICAL: Props the box open to 75% of screen height
-                overflow: 'hidden', 
-                paddingTop: 20
-              }}>
-                
-                {/* Static Header */}
-                <Text style={{ 
-                  color: accentColor, 
-                  fontSize: 22, 
-                  fontWeight: 'bold', 
-                  textAlign: 'center', 
-                  marginBottom: 16 
-                }}>
-                  Settings
-                </Text>
+            <Text style={{ color: accentColor, fontSize: 22, fontWeight: 'bold', textAlign: 'center', marginBottom: 16 }}>
+              Settings
+            </Text>
 
                 {/* The Scrollable Inner Content */}
                 <ScrollView 
@@ -917,6 +1281,7 @@ const ChatScreen = () => {
                   showsVerticalScrollIndicator={true}
                   nestedScrollEnabled={true}
                   keyboardShouldPersistTaps="handled"
+                  scrollEventThrottle={16}
                 >
                   
                   {/* Role Profile Panel */}
@@ -962,25 +1327,155 @@ const ChatScreen = () => {
                   {/* Core Memory Panel */}
                   <View style={styles.settingsPanel}>
                     <Text style={styles.modalLabel}>Local Backend Memory</Text>
-                    <Text style={{ color: '#888', fontSize: 12, marginBottom: 10 }}>Host: {backendURL?.replace('http://', '')?.split(':')[0] || 'Unknown'}</Text>
                     <View style={{ backgroundColor: 'rgba(0,0,0,0.3)', borderRadius: 8, padding: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-                      {coreMemory.length > 0 ? (
-                        coreMemory.map((item, index) => (
-                          <Text key={index} style={{ color: '#00FF66', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 12, marginBottom: 4 }}>&gt; {item}</Text>
-                        ))
+                      {coreMemories.length === 0 ? (
+                        <Text style={{ color: '#666', fontStyle: 'italic', fontSize: 13 }}>No core memories active.</Text>
                       ) : (
-                        <Text style={{ color: '#888', fontStyle: 'italic', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', fontSize: 12 }}>No core memories active.</Text>
+                        coreMemories.map((memory, index) => (
+                          <View key={index} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 6 }}>
+                            <View style={{ width: 4, height: 4, borderRadius: 2, backgroundColor: accentColor, marginRight: 8 }} />
+                            <Text style={{ color: '#E0E0E0', fontSize: 13 }}>{memory}</Text>
+                          </View>
+                        ))
                       )}
                     </View>
                   </View>
+
                 </ScrollView>
 
-              </View>
-            </TouchableWithoutFeedback>
           </View>
-        </TouchableWithoutFeedback>
+        </View>
       </Modal>
 
+      {/* Secure Switch Account Modal */}
+      <Modal visible={isSwitchAuthVisible} transparent animationType="slide">
+        <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+          <Pressable style={[StyleSheet.absoluteFill, { backgroundColor: 'rgba(0,0,0,0.8)' }]} onPress={() => setIsSwitchAuthVisible(false)} />
+          
+          <View style={{ backgroundColor: '#1E1E20', borderRadius: 24, width: '85%', padding: 24, zIndex: 1 }}>
+            
+            {/* STYLED SUCCESS VIEW */}
+            {authSuccessMessage ? (
+              <View style={{ alignItems: 'center', paddingVertical: 20 }}>
+                <CheckCircle color={accentColor} size={64} style={{ marginBottom: 16 }} />
+                <Text style={{ color: '#FFF', fontSize: 18, fontWeight: 'bold', textAlign: 'center' }}>{authSuccessMessage}</Text>
+              </View>
+            ) : (
+              <>
+                <Text style={{ color: accentColor, fontSize: 20, fontWeight: 'bold', textAlign: 'center', marginBottom: 20 }}>
+                  Select Profile
+                </Text>
+                
+                <ScrollView style={{ maxHeight: 160, marginBottom: 16 }}>
+                  {availableAccounts.map(account => (
+                    <View key={account.name} style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 8 }}>
+                      
+                      <TouchableOpacity 
+                        style={{ flex: 1, padding: 12, backgroundColor: selectedAccountName === account.name && authAction === 'login' ? 'rgba(255,255,255,0.1)' : 'transparent', borderRadius: 8, flexDirection: 'row', justifyContent: 'space-between' }}
+                        onPress={() => { setSelectedAccountName(account.name); setAuthAction('login'); setAuthError(''); }}
+                      >
+                        <Text style={{ color: selectedAccountName === account.name && authAction === 'login' ? accentColor : '#FFF', fontWeight: 'bold' }}>
+                          {account.name}
+                        </Text>
+                        <Text style={{ color: '#A1A1AA', fontSize: 12, alignSelf: 'center' }}>{account.role}</Text>
+                      </TouchableOpacity>
+
+                      {/* NEW PROFESSIONAL TRASH ICON */}
+                      <TouchableOpacity 
+                        style={{ padding: 12, marginLeft: 8, backgroundColor: selectedAccountName === account.name && authAction === 'delete' ? 'rgba(239, 68, 68, 0.2)' : 'transparent', borderRadius: 8 }}
+                        onPress={() => { setSelectedAccountName(account.name); setAuthAction('delete'); setAuthError(''); }}
+                      >
+                        <Trash2 color={selectedAccountName === account.name && authAction === 'delete' ? '#EF4444' : '#666'} size={20} />
+                      </TouchableOpacity>
+                    </View>
+                  ))}
+                </ScrollView>
+
+                <Text style={{ color: authAction === 'delete' ? '#EF4444' : '#A1A1AA', fontSize: 14, marginBottom: 8, textAlign: 'center' }}>
+                  {authAction === 'delete' ? 'Enter PIN to permanently DELETE:' : 'Enter 6-Digit PIN to unlock:'}
+                </Text>
+                
+                <TextInput
+                  style={{ backgroundColor: 'rgba(0,0,0,0.3)', color: authAction === 'delete' ? '#EF4444' : '#FFF', padding: 16, borderRadius: 12, fontSize: 20, textAlign: 'center', letterSpacing: 8, marginBottom: 16 }}
+                  keyboardType="numeric"
+                  maxLength={6}
+                  secureTextEntry
+                  value={switchPin}
+                  onChangeText={setSwitchPin}
+                />
+
+                {authError ? <Text style={{ color: '#EF4444', textAlign: 'center', marginBottom: 16 }}>{authError}</Text> : null}
+
+                {/* BUTTON ROW: PIN SUBMIT & BIOMETRICS */}
+                <View style={{ flexDirection: 'row', gap: 12 }}>
+                  <TouchableOpacity 
+                    style={{ flex: 1, backgroundColor: authAction === 'delete' ? '#EF4444' : accentColor, padding: 16, borderRadius: 12, alignItems: 'center', justifyContent: 'center' }}
+                    onPress={() => executeSecureAuthAction(false)}
+                  >
+                    <Text style={{ color: authAction === 'delete' ? '#FFF' : '#000', fontWeight: 'bold', fontSize: 16 }}>
+                      {authAction === 'delete' ? 'Delete Profile' : 'Unlock'}
+                    </Text>
+                  </TouchableOpacity>
+
+                  {/* BIOMETRIC BUTTON */}
+                  <TouchableOpacity 
+                    style={{ backgroundColor: 'rgba(255,255,255,0.1)', padding: 16, borderRadius: 12, alignItems: 'center', justifyContent: 'center' }}
+                    onPress={handleBiometricAuth}
+                  >
+                    <Fingerprint color={accentColor} size={24} />
+                  </TouchableOpacity>
+                </View>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      <Modal transparent visible={actionMenuVisible} animationType="slide">
+        <Pressable 
+          style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.6)', justifyContent: 'flex-end' }}
+          onPress={() => setActionMenuVisible(false)}
+        >
+          <View style={{ 
+            backgroundColor: '#1E1E20', borderRadius: 24, marginHorizontal: 16, marginBottom: 32, padding: 24,
+            borderWidth: 1, borderColor: 'rgba(255,255,255,0.1)', elevation: 10
+          }}>
+            <Text style={{ color: '#FFFFFF', fontSize: 18, fontWeight: 'bold', marginBottom: 20 }}>Message Actions</Text>
+            
+            {/* Copy Action */}
+            <Pressable 
+              style={{ paddingVertical: 16, borderBottomWidth: 1, borderBottomColor: 'rgba(255,255,255,0.05)' }}
+              onPress={() => {
+                ExpoClipboard.setStringAsync(selectedMessageText);
+                Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+                setActionMenuVisible(false);
+              }}
+            >
+              <Text style={{ color: accentColor, fontSize: 16, fontWeight: '600' }}>Copy Text</Text>
+            </Pressable>
+
+            {/* Regenerate Action */}
+            <Pressable 
+              style={{ paddingVertical: 16 }}
+              onPress={() => {
+                setActionMenuVisible(false);
+                const targetIndex = messages.findIndex(msg => msg.content === selectedMessageText);
+                if (targetIndex === -1) return;
+                
+                const updatedHistory = messages.slice(0, targetIndex);
+                setMessages(updatedHistory);
+                
+                const lastUserMessage = [...updatedHistory].reverse().find(m => m.role === 'user');
+                if (lastUserMessage) {
+                  sendMessage(lastUserMessage.content, updatedHistory);
+                }
+              }}
+            >
+              <Text style={{ color: '#E0E0E0', fontSize: 16 }}>Regenerate Response</Text>
+            </Pressable>
+          </View>
+        </Pressable>
+      </Modal>
     </View>
   );
 }

@@ -114,21 +114,49 @@ export default function LoginScreen() {
     shuffleKeypad();
   }, [shuffleKeypad]);
 
-  const handleBiometricAuth = async () => {
+  const handleBiometricAuth = async (overrideName?: string) => {
+    const activeName = overrideName || name;
+    if (!activeName) {
+      Alert.alert("Select Account", "Please enter or select an account name to log into first.");
+      return;
+    }
+
     try {
       const hasHardware = await LocalAuthentication.hasHardwareAsync();
       const isEnrolled = await LocalAuthentication.isEnrolledAsync();
 
-      if (hasHardware && isEnrolled) {
-        const result = await LocalAuthentication.authenticateAsync({ 
-          promptMessage: 'Login to CodeAmigo' 
+      if (!hasHardware || !isEnrolled) {
+        Alert.alert("Unavailable", "Biometrics not setup on this device.");
+        return;
+      }
+
+      const result = await LocalAuthentication.authenticateAsync({ 
+        promptMessage: 'Login to CodeAmigo',
+        fallbackLabel: 'Use PIN'
+      });
+      
+      if (result.success) {
+        const response = await fetch(`${getBackendURL()}/auth/login`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ 
+            name: activeName, 
+            pin: null,
+            biometric_auth: true
+          })
         });
-        if (result.success) {
+        
+        const data = await response.json();
+        
+        if (data.status === 'success') {
+          await SecureStore.setItemAsync('session_token', data.session_token);
           router.replace({ pathname: '/scanner', params: { source: 'login' } });
+        } else {
+          Alert.alert("Authentication Failed", data.detail || "Invalid user.");
         }
       }
     } catch (e) {
-      console.error("Error with biometric login", e);
+      Alert.alert("Network Error", "Could not reach the server.");
     }
   };
 
@@ -139,8 +167,10 @@ export default function LoginScreen() {
         const stored = await SecureStore.getItemAsync('saved_name');
         if (stored) {
           setName(stored);
+          await handleBiometricAuth(stored);
+        } else {
+          await handleBiometricAuth();
         }
-        await handleBiometricAuth();
       } catch (e) {
         console.error("Error loading biometric login", e);
       }
@@ -167,6 +197,20 @@ export default function LoginScreen() {
         await SecureStore.setItemAsync('saved_name', name);
         router.replace({ pathname: '/scanner', params: { source: 'login' } });
       } else {
+        // GHOST ACCOUNT INTERCEPTOR
+        if (data.detail === "Invalid user.") {
+          Alert.alert(
+            "Account Not Found", 
+            "This account has been deleted from the server. Returning to Sign Up."
+          );
+          await SecureStore.deleteItemAsync('session_token');
+          await SecureStore.deleteItemAsync('saved_name');
+          await SecureStore.deleteItemAsync('is_device_registered');
+          
+          router.replace('/signup');
+          return; 
+        }
+
         const errorDetail = typeof data.detail === 'string' ? data.detail : (data.message || "Invalid PIN.");
         setErrorMsg(errorDetail);
         setPin([]);
@@ -240,7 +284,7 @@ export default function LoginScreen() {
           
           {isSubmitting && <ActivityIndicator style={{marginTop: 20}} size="small" color="#0A84FF" />}
 
-          <TouchableOpacity onPress={handleBiometricAuth} style={styles.biometricButton}>
+          <TouchableOpacity onPress={() => handleBiometricAuth()} style={styles.biometricButton}>
             <Ionicons name="finger-print" size={24} color="#0A84FF" />
             <Text style={styles.biometricText}>Login using Fingerprint</Text>
           </TouchableOpacity>
