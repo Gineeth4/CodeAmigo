@@ -9,6 +9,7 @@ import uvicorn
 import httpx
 import pyperclip
 import pyautogui
+import platform
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -312,59 +313,45 @@ import re
 import os
 import json
 
-import requests
-import urllib.parse
-from bs4 import BeautifulSoup # Requires: pip install beautifulsoup4
-
-from googlesearch import search as gsearch
-from ddgs import DDGS
-from datetime import datetime
+from tavily import AsyncTavilyClient
 import asyncio
+import re
+import os
+from datetime import datetime
 
-# Pass the full messages array to retain conversation context
+# Initialize the client (Dev must set TAVILY_API_KEY in environment variables)
+tavily_client = AsyncTavilyClient(api_key=os.environ.get("TAVILY_API_KEY", "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"))
+
 async def fetch_web_context(messages: list) -> str:
-    """Industry-Level Agent: Smart query generation with Google -> DDGS fallback."""
+    """Industry-Level Agent: Optimized for <8s latency using Tavily pre-computed answers."""
     
-    def execute_search():
-        user_msgs = [m.get('content', '') for m in messages if m.get('role') == 'user']
-        if not user_msgs: return ""
+    user_msgs = [m.get('content', '') for m in messages if m.get('role') == 'user']
+    if not user_msgs: return ""
+    
+    # Smart Query Builder (Same as before)
+    last_msg = user_msgs[-1]
+    prev_msg = user_msgs[-2] if len(user_msgs) > 1 else ""
+    raw_query = f"{prev_msg} {last_msg}" if len(last_msg.split()) <= 4 and prev_msg else last_msg
+    clean_query = re.sub(r'(?i)(never mind|ignore that|check exactly|search the web|man|bro|dude)', '', raw_query).strip()
+    if not clean_query: return ""
+
+    try:
+        # CRITICAL CHANGE: include_answer=True forces Tavily to pre-summarize the result.
+        # This shrinks the LLM prompt massively, solving the 60-second latency issue.
+        response = await tavily_client.search(
+            query=clean_query, 
+            search_depth="basic", 
+            include_answer=True, 
+            max_results=2
+        )
         
-        last_msg = user_msgs[-1]
-        prev_msg = user_msgs[-2] if len(user_msgs) > 1 else ""
-        
-        # 1. Smart Query Builder: Only combine if the latest message is a fragment (< 5 words)
-        if len(last_msg.split()) <= 4 and prev_msg:
-            raw_query = f"{prev_msg} {last_msg}"
-        else:
-            raw_query = last_msg
+        if response and response.get("answer"):
+            return f"- {response['answer']}"
             
-        # Aggressively clean conversational filler that breaks search engines
-        clean_query = re.sub(r'(?i)(never mind|ignore that|check exactly|check in a live|no i think it is wrong|man|bro|dude)', '', raw_query).strip()
-        if not clean_query: return ""
-
-        snippets = []
+    except Exception as e:
+        print(f"Tavily Search Failed: {e}")
         
-        # 2. Dual-Engine Scraper: Try Google First
-        try:
-            results = gsearch(clean_query, num_results=4, sleep_interval=1.0, advanced=True)
-            snippets = [res.description for res in results if hasattr(res, 'description') and res.description]
-        except Exception as e:
-            print(f"Google Search failed or blocked: {e}")
-            
-        # 3. Fallback to DDGS if Google fails
-        if not snippets:
-            try:
-                with DDGS() as ddgs:
-                    ddgs_results = list(ddgs.text(clean_query, max_results=4))
-                    snippets = [r.get('body') for r in ddgs_results if r.get('body')]
-            except Exception as e:
-                print(f"DDGS Fallback failed: {e}")
-
-        if snippets:
-            return "\n".join([f"- {s}" for s in snippets])
-        return ""
-
-    return await asyncio.to_thread(execute_search)
+    return ""
 
 def extract_core_memory(prompt: str, name: str = None):
     prompt_lower = prompt.lower().strip()
@@ -484,7 +471,9 @@ async def chat(req: ChatRequest, request: Request, session_token: str = Header(N
             
             if web_results:
                 system_prompt += f"<web_context>\n{web_results}\n</web_context>\n"
-                system_prompt += "<strict_rules>\nAGENTIC MODE ACTIVE. Answer the user's prompt using EXACTLY the facts in the <web_context>. Ignore conversational filler (e.g. 'Never mind'). DO NOT apologize. DO NOT hallucinate.\n</strict_rules>\n"
+                
+                # NEW: Absolute Anti-Hallucination Guardrail
+                system_prompt += "<strict_rules>\nAGENTIC MODE ACTIVE. You MUST formulate your answer strictly using the facts provided in the <web_context>. You are FORBIDDEN from using the phrases 'As of my last update', 'I cannot provide real-time', or relying on your base training weights. If the answer is in the <web_context>, state it confidently as an absolute fact.\n</strict_rules>\n"
             else:
                 # THE ABSOLUTE OVERRIDE: Forces the LLM to admit it has no data instead of hallucinating.
                 system_prompt += "<strict_rules>\nAGENTIC MODE ACTIVE. The Google search returned no data. You are FORBIDDEN from saying 'I apologize' or guessing the answer. You MUST reply with EXACTLY this string and nothing else: 'I could not find live web data for that specific query.'\n</strict_rules>\n"
@@ -626,6 +615,66 @@ async def transcribe(req: TranscribeRequest, request: Request, session_token: st
 
     return {"status": "success", "text": "This is a dictated voice prompt [Dictation Placeholder]."}
 
+def clean_code_for_ide(raw_llm_output: str) -> str:
+    """Strips Markdown backticks and language identifiers so only raw, compilable code is typed."""
+    # Look for code blocks wrapped in ``` and extract only the inner content
+    match = re.search(r'```[a-zA-Z]*\n(.*?)```', raw_llm_output, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    
+    # Fallback: If the LLM didn't use backticks, just strip leading/trailing whitespace
+    return raw_llm_output.strip()
+
+async def stream_and_type_code(ollama_async_stream):
+    """Streams tokens via SSE and losslessly pastes code, strictly swallowing markdown language tags."""
+    
+    in_code_block = False
+    stripping_language_tag = False
+    buffer = ""
+    paste_hotkey = 'command' if platform.system() == 'Darwin' else 'ctrl'
+    
+    async for chunk in ollama_async_stream:
+        token = chunk.get('message', {}).get('content', '')
+        if not token: continue
+            
+        # 1. Stream to Frontend instantly
+        yield f"data: {token}\n\n"
+        buffer += token
+        
+        # 2. Handle Markdown Code Fences
+        if "```" in buffer:
+            parts = buffer.split("```")
+            if len(parts) > 1:
+                in_code_block = not in_code_block
+                buffer = parts[-1] 
+                
+                if in_code_block:
+                    # We just entered a code block. Activate the tag stripper.
+                    stripping_language_tag = True
+        
+        # 3. Swallow the language tag (e.g., "java\n") across fragmented chunks
+        if in_code_block and "```" not in buffer:
+            if stripping_language_tag:
+                if "\n" in buffer:
+                    # The language tag is complete. Strip everything up to the first newline.
+                    buffer = buffer.split("\n", 1)[-1]
+                    stripping_language_tag = False
+                else:
+                    # The newline hasn't arrived yet. Keep accumulating tokens and do NOT type.
+                    continue
+                    
+            # 4. Lossless Clipboard Injection (Line-by-Line)
+            if "\n" in buffer and not stripping_language_tag:
+                lines = buffer.split("\n")
+                # Paste all complete lines
+                for line in lines[:-1]:
+                    pyperclip.copy(line + "\n")
+                    pyautogui.hotkey(paste_hotkey, 'v')
+                    await asyncio.sleep(0.05) # Micro-sleep for OS clipboard stabilization
+                
+                # Keep the incomplete line in the buffer
+                buffer = lines[-1]
+
 class AgentRequest(BaseModel):
     prompt: str
     name: Optional[str] = None # NEW: Allows frontend to pass the active user
@@ -653,64 +702,22 @@ async def agent_type_code(req: AgentRequest, request: Request, session_token: st
         ollama_url = "http://localhost:11434/api/chat"
         payload = {"model": "qwen2.5-coder:7b", "messages": messages_payload, "stream": True}
         
-        import pyperclip
-        import pyautogui
-        import platform
-        import time
-        
-        modifier = 'command' if platform.system() == 'Darwin' else 'ctrl'
-        
-        # Save the user's original clipboard
-        original_clipboard = pyperclip.paste()
-        if not isinstance(original_clipboard, str):
-            original_clipboard = ""
-            
-        chunk_buffer = ""
-        
         import httpx
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", ollama_url, json=payload) as response:
-                async for line in response.aiter_lines():
-                    if line:
-                        try:
-                            chunk_data = json.loads(line)
-                            token = chunk_data.get("message", {}).get("content", "")
-                            
-                            if token:
-                                # 1. Stream immediately to the mobile app UI
-                                yield f"data: {json.dumps({'chunk': token})}\n\n"
-                                
-                                chunk_buffer += token
-                                
-                                # 2. Trigger paste on word boundaries or newlines for a streaming effect
-                                # Waiting for a space or newline ensures we don't chop words in half
-                                if chunk_buffer.endswith(" ") or chunk_buffer.endswith("\n") or len(chunk_buffer) > 12:
-                                    
-                                    # On-the-fly markdown stripping just in case the LLM disobeys
-                                    clean_chunk = chunk_buffer.replace("```python", "").replace("```java", "").replace("```", "")
-                                    
-                                    if clean_chunk:
-                                        pyperclip.copy(clean_chunk)
-                                        pyautogui.hotkey(modifier, 'v')
-                                        time.sleep(0.02) # Tiny delay creates a smooth, human-like typing cadence
-                                        
-                                    chunk_buffer = "" # Reset buffer
-                                    
-                            if chunk_data.get("done") is True:
-                                # Inject any remaining text in the buffer
-                                if chunk_buffer:
-                                    clean_chunk = chunk_buffer.replace("```", "")
-                                    if clean_chunk:
-                                        pyperclip.copy(clean_chunk)
-                                        pyautogui.hotkey(modifier, 'v')
-                                        time.sleep(0.02)
-                                        
-                                # Restore the user's original clipboard safely
-                                time.sleep(0.3)
-                                pyperclip.copy(original_clipboard)
-                                yield "data: [DONE]\n\n"
-                        except Exception:
-                            pass
+        
+        async def ollama_stream():
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream("POST", ollama_url, json=payload) as response:
+                    async for line in response.aiter_lines():
+                        if line:
+                            try:
+                                yield json.loads(line)
+                            except Exception:
+                                pass
+
+        async for sse_event in stream_and_type_code(ollama_stream()):
+            yield sse_event
+
+        yield "data: [DONE]\n\n"
                             
     return StreamingResponse(generate_and_inject(), media_type="text/event-stream")
 
